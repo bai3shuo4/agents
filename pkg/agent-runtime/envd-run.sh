@@ -148,6 +148,6 @@ create_user() {
 # Execute user creation (don't let it fail the entire script)
 create_user || echo "Warning: User creation encountered issues, but continuing..." >&2
 
-# Start Envd
+# Start Envd in non-FC mode (Kubernetes environment does not have MMDS)
 export GODEBUG=multipathtcp=0
-nohup $ENVD_DIR/envd > /proc/1/fd/1 2>&1 &
+nohup $ENVD_DIR/envd -isnotfc > /proc/1/fd/1 2>&1 &

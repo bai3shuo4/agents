@@ -24,10 +24,10 @@ import (
 	"strings"
 )
 
-// stateFilePath is the path to the persisted mount state file.
-// It is stored in an emptyDir volume so it is scoped to the Pod and does not
-// need hostname-based subdirectories for isolation.
-const stateFilePath = "/run/csi/.state/mounts.json"
+// stateDir is the directory where per-mount state files are stored.
+// Each mount gets its own <volumeId>.json file so concurrent mount processes
+// never write to the same file, eliminating the need for file locking.
+const stateDir = "/run/csi/.state"
 
 // MountRecord describes a single dynamic CSI mount.
 type MountRecord struct {
@@ -127,41 +127,39 @@ func createSymlink(target, link string) error {
 	return os.Symlink(target, link)
 }
 
+// recordStatePath returns the per-mount state file path.
+// Uses VolumeId when available; falls back to sanitized mountPath.
+func recordStatePath(record MountRecord) string {
+	name := record.VolumeId
+	if name == "" {
+		name = sanitizeSubPath(record.MountPath)
+	}
+	return filepath.Join(stateDir, name+".json")
+}
+
 func saveMountRecord(record MountRecord) error {
-	state, err := loadState()
+	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
-		if os.IsNotExist(err) {
-			state = &MountState{Mounts: []MountRecord{}}
-		} else {
-			return fmt.Errorf("failed to load state: %w", err)
-		}
+		return fmt.Errorf("failed to marshal record: %w", err)
 	}
 
-	// Deduplicate by mountPath
-	found := false
-	for i, m := range state.Mounts {
-		if m.MountPath == record.MountPath {
-			state.Mounts[i] = record
-			found = true
-			break
-		}
-	}
-	if !found {
-		state.Mounts = append(state.Mounts, record)
-	}
-
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal state: %w", err)
-	}
-
-	if err := os.MkdirAll(filepath.Dir(stateFilePath), 0750); err != nil {
+	path := recordStatePath(record)
+	if err := os.MkdirAll(stateDir, 0750); err != nil {
 		return fmt.Errorf("failed to create state directory: %w", err)
 	}
 
-	if err := os.WriteFile(stateFilePath, data, 0640); err != nil {
-		return fmt.Errorf("failed to write state file: %w", err)
+	// Write to a temporary file and rename for atomicity.
+	// This prevents reading a partially-written file if the process is killed mid-write.
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0640); err != nil {
+		return fmt.Errorf("failed to write temp state file %s: %w", tmpPath, err)
 	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to rename temp state file to %s: %w", path, err)
+	}
+
+	fmt.Fprintf(os.Stdout, "[saveMountRecord] wrote state file %s (size=%d bytes):\n%s\n", path, len(data), string(data))
 	return nil
 }
 
@@ -248,36 +246,101 @@ func rebuildStateFromSymlinks() error {
 }
 
 func loadState() (*MountState, error) {
-	data, err := os.ReadFile(stateFilePath)
+	entries, err := os.ReadDir(stateDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return &MountState{Mounts: []MountRecord{}}, nil
+		}
 		return nil, err
 	}
-	var state MountState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal state: %w", err)
+
+	var mounts []MountRecord
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(stateDir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to read state file %s: %v\n", path, err)
+			continue
+		}
+		var record MountRecord
+		if err := json.Unmarshal(data, &record); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to unmarshal state file %s (size=%d bytes): %v\n", path, len(data), err)
+			fmt.Fprintf(os.Stderr, "[loadState] raw content of %s:\n%s\n", path, string(data))
+
+			// Copy corrupted file to log directory for post-mortem analysis.
+			if podName := os.Getenv("POD_NAME"); podName != "" {
+				logDir := filepath.Join("/var/log/csi", podName)
+				_ = os.MkdirAll(logDir, 0755)
+				corruptedPath := filepath.Join(logDir, "corrupted-"+entry.Name())
+				if cpErr := os.WriteFile(corruptedPath, data, 0640); cpErr == nil {
+					fmt.Fprintf(os.Stderr, "[loadState] copied corrupted state to %s\n", corruptedPath)
+				} else {
+					fmt.Fprintf(os.Stderr, "[loadState] failed to copy corrupted state to %s: %v\n", corruptedPath, cpErr)
+				}
+			}
+			continue
+		}
+		mounts = append(mounts, record)
 	}
-	return &state, nil
+	return &MountState{Mounts: mounts}, nil
 }
 
-// saveState writes the full MountState to the state file.
+// saveState writes the full MountState by saving each record to its own file
+// and removing files for records that are no longer present.
 func saveState(state *MountState) error {
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal state: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(stateFilePath), 0750); err != nil {
+	if err := os.MkdirAll(stateDir, 0750); err != nil {
 		return fmt.Errorf("failed to create state directory: %w", err)
 	}
-	if err := os.WriteFile(stateFilePath, data, 0640); err != nil {
-		return fmt.Errorf("failed to write state file: %w", err)
+
+	// Save all current records.
+	for _, record := range state.Mounts {
+		if err := saveMountRecord(record); err != nil {
+			return err
+		}
+	}
+
+	// Clean up files for records that are no longer in state.
+	entries, err := os.ReadDir(stateDir)
+	if err != nil {
+		return nil
+	}
+
+	currentFiles := make(map[string]bool)
+	for _, record := range state.Mounts {
+		currentFiles[filepath.Base(recordStatePath(record))] = true
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if !currentFiles[entry.Name()] {
+			_ = os.Remove(filepath.Join(stateDir, entry.Name()))
+		}
 	}
 	return nil
 }
 
-// clearState removes the state file.
+// clearState removes all state files under the state directory.
+// It does not remove the directory itself because it may be a volume mount point.
 func clearState() error {
-	if err := os.Remove(stateFilePath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to remove state file: %w", err)
+	entries, err := os.ReadDir(stateDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read state directory: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(stateDir, entry.Name())); err != nil {
+			return fmt.Errorf("failed to remove state file %s: %w", entry.Name(), err)
+		}
 	}
 	return nil
 }

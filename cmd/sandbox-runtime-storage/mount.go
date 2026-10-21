@@ -203,7 +203,7 @@ func runMount(ctx context.Context, opts *mountOptions) error {
 		}
 		return fmt.Errorf("failed to save mount record: %w", err)
 	}
-	fmt.Fprintf(os.Stdout, "saved mount state to %s\n", stateFilePath)
+	fmt.Fprintf(os.Stdout, "saved mount state to %s\n", recordStatePath(record))
 
 	return nil
 }

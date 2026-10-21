@@ -28,6 +28,11 @@ const (
 	//   /var/run/csi/sockets/<driverName>
 	csiSocketBaseDir = "/var/run/csi/sockets"
 	csiSocketName    = "csi.sock"
+
+	// csiDriverInternalSocket is the standard unix socket path inside a CSI driver container.
+	// When running inside the CSI driver sidecar (via --in-csi-driver), the gRPC listener
+	// is typically bound at /csi/csi.sock (e.g., nfs-subdir-external-provisioner).
+	csiDriverInternalSocket = "/csi/csi.sock"
 )
 
 // resolveCSISocket returns the unix socket path for the given CSI driver.
@@ -39,4 +44,15 @@ func resolveCSISocket(driverName string) (string, error) {
 		return "", fmt.Errorf("csi socket not found at %s: %w", socketPath, err)
 	}
 	return socketPath, nil
+}
+
+// resolveCSISocketInDriver returns the unix socket path when running inside
+// the CSI driver sidecar container itself. In this mode the socket is at a
+// fixed well-known path (/csi/csi.sock) because the sidecar and the driver
+// share the same network/pid namespace or volume mounts.
+func resolveCSISocketInDriver() (string, error) {
+	if _, err := os.Stat(csiDriverInternalSocket); err != nil {
+		return "", fmt.Errorf("csi socket not found at %s: %w", csiDriverInternalSocket, err)
+	}
+	return csiDriverInternalSocket, nil
 }

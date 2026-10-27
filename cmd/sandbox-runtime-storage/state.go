@@ -148,9 +148,10 @@ func saveMountRecord(record MountRecord) error {
 		return fmt.Errorf("failed to create state directory: %w", err)
 	}
 
-	// Write to a temporary file and rename for atomicity.
-	// This prevents reading a partially-written file if the process is killed mid-write.
-	tmpPath := path + ".tmp"
+	// Write to a temporary file with a unique suffix and rename for atomicity.
+	// The unique suffix (based on PID) prevents concurrent processes from
+	// overwriting each other's temp file when targeting the same final state file.
+	tmpPath := fmt.Sprintf("%s.tmp.%d", path, os.Getpid())
 	if err := os.WriteFile(tmpPath, data, 0640); err != nil {
 		return fmt.Errorf("failed to write temp state file %s: %w", tmpPath, err)
 	}

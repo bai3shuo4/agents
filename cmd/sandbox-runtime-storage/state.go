@@ -128,11 +128,14 @@ func createSymlink(target, link string) error {
 }
 
 // recordStatePath returns the per-mount state file path.
-// Uses VolumeId when available; falls back to sanitized mountPath.
+// Uses VolumeId + sanitized MountPath when available; falls back to sanitized mountPath.
+// This handles the case where multiple mount directories share the same volume.
 func recordStatePath(record MountRecord) string {
 	name := record.VolumeId
 	if name == "" {
 		name = sanitizeSubPath(record.MountPath)
+	} else if record.MountPath != "" && record.MountPath != "/" {
+		name = name + "_" + sanitizeSubPath(record.MountPath)
 	}
 	return filepath.Join(stateDir, name+".json")
 }

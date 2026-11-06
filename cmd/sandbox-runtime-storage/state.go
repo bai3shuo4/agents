@@ -227,9 +227,17 @@ func rebuildStateFromSymlinks() error {
 				subPath = parts[len(parts)-1]
 			}
 
+			// Determine driver from environment variable, falling back to the default.
+			// This allows the inject configmap to control which CSI driver is used
+			// (e.g., nfs.csi.k8s.io or efs.csi.aws.com) for rebuild scenarios.
+			driver := os.Getenv("SANDBOX_CSI_DRIVER_NAME")
+			if driver == "" {
+				driver = "nfs.csi.k8s.io"
+			}
+
 			record := MountRecord{
-				Driver:          "nfs.csi.k8s.io",
-				VolumeId:        "", // Cannot be reliably recovered from symlink alone
+				Driver:          driver,
+				VolumeId:        fmt.Sprintf("rebuild-%s-%s", pvName, subPath),
 				PVName:          pvName,
 				SubPath:         subPath,
 				MountPath:       filepath.Join("/", mountPath),

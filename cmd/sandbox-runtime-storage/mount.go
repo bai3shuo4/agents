@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -79,7 +80,46 @@ func runMount(ctx context.Context, opts *mountOptions) error {
 	}
 	symlinkPath := filepath.Join(symlinkBase, originalMountPath)
 
-	// 3. Build actual mount path: /run/csi/mount-root/<hostname>/<pvname>/<sanitized-subpath>
+	// 3. Extract pvName from the original VolumeId before any rewrite.
+	// This must happen before the EFS-specific rewrite because the rewritten
+	// VolumeId does not follow the <pvName>-<random> convention.
+	pvName := extractPVName(req.VolumeId)
+
+	// 4. Rewrite VolumeId for EFS driver if needed.
+	// EFS driver expects VolumeId in one of two colon-delimited formats:
+	//   New: {fsType}:{fileSystemID}:{mountPath}:{accessPointID}
+	//   Old: {fileSystemID}:{mountPath}:{accessPointID}
+	//
+	// Prefer the explicit sandboxVolumeHandle from volumeAttributes (set in the PV
+	// to match the driver's expected volumeHandle), falling back to reconstructing
+	// it from fileSystemId, path and accessPointId fields.
+	if opts.driver == "efs.csi.aws.com" {
+		if sandboxVolumeHandle := req.VolumeContext["sandboxVolumeHandle"]; sandboxVolumeHandle != "" {
+			req.VolumeId = sandboxVolumeHandle
+			fmt.Fprintf(os.Stdout, "rewrote VolumeId for EFS from sandboxVolumeHandle: %s\n", req.VolumeId)
+		} else if fsid := req.VolumeContext["fileSystemId"]; fsid != "" {
+			subPath := req.VolumeContext["path"]
+			if subPath == "" || subPath == "/" {
+				subPath = "/"
+			} else {
+				subPath = strings.TrimLeft(subPath, "/")
+			}
+
+			accessPointId := req.VolumeContext["accessPointId"]
+			if accessPointId == "" {
+				accessPointId = req.VolumeContext["accesspointid"]
+			}
+
+			if accessPointId != "" {
+				req.VolumeId = fmt.Sprintf("efs:%s:%s:%s", fsid, subPath, accessPointId)
+			} else {
+				req.VolumeId = fmt.Sprintf("efs:%s:%s", fsid, subPath)
+			}
+			fmt.Fprintf(os.Stdout, "rewrote VolumeId for EFS: %s\n", req.VolumeId)
+		}
+	}
+
+	// 5. Build actual mount path: /run/csi/mount-root/<hostname>/<pvname>/<sanitized-subpath>
 	//
 	// The sub-path (merged from PV base path + SandboxClaim subPath) is encoded
 	// into the directory name so that the same PV can be mounted to different
@@ -89,7 +129,6 @@ func runMount(ctx context.Context, opts *mountOptions) error {
 		hostname = "unknown"
 	}
 
-	pvName := extractPVName(req.VolumeId)
 	subPath := req.VolumeContext["path"]
 	actualMountPath := buildActualMountPath(hostname, pvName, subPath)
 
@@ -112,21 +151,21 @@ func runMount(ctx context.Context, opts *mountOptions) error {
 		}
 	}
 
-	// 4. Update TargetPath to the actual mount path for the CSI driver
+	// 6. Update TargetPath to the actual mount path for the CSI driver
 	req.TargetPath = actualMountPath
 
-	// 5. Ensure actual target mount path exists
+	// 7. Ensure actual target mount path exists
 	if err := os.MkdirAll(actualMountPath, 0750); err != nil {
 		return fmt.Errorf("failed to create actual mount path %s: %w", actualMountPath, err)
 	}
 
-	// 6. Resolve CSI driver unix socket
+	// 8. Resolve CSI driver unix socket
 	socketPath, err := resolveCSISocket(opts.driver)
 	if err != nil {
 		return err
 	}
 
-	// 7. Dial the CSI Node plugin over unix socket
+	// 9. Dial the CSI Node plugin over unix socket
 	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
@@ -141,7 +180,7 @@ func runMount(ctx context.Context, opts *mountOptions) error {
 	}
 	defer conn.Close()
 
-	// 8. Call NodePublishVolume
+	// 10. Call NodePublishVolume
 	nodeClient := csi.NewNodeClient(conn)
 	callCtx, callCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer callCancel()
@@ -154,7 +193,7 @@ func runMount(ctx context.Context, opts *mountOptions) error {
 
 	fmt.Fprintf(os.Stdout, "CSI mounted %s via driver %s\n", actualMountPath, opts.driver)
 
-	// 9. Create symlink under the configured base directory so it survives container restarts.
+	// 11. Create symlink under the configured base directory so it survives container restarts.
 	if err := createSymlink(actualMountPath, symlinkPath); err != nil {
 		// Rollback: unmount the volume to avoid leaving orphaned mounts on the node.
 		fmt.Fprintf(os.Stderr, "failed to create symlink %s -> %s, rolling back mount...\n", symlinkPath, actualMountPath)
@@ -174,7 +213,7 @@ func runMount(ctx context.Context, opts *mountOptions) error {
 	fmt.Fprintf(os.Stdout, "created symlink: %s -> %s\n", symlinkPath, actualMountPath)
 	fmt.Fprintf(os.Stdout, "user should access mount via: %s\n", symlinkPath)
 
-	// 10. Persist mount state for recovery after container restart
+	// 12. Persist mount state for recovery after container restart
 	record := MountRecord{
 		Driver:          opts.driver,
 		VolumeId:        req.VolumeId,
